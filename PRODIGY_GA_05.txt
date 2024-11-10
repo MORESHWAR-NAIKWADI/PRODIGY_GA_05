@@ -1,0 +1,135 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import models, transforms
+from PIL import Image
+import matplotlib.pyplot as plt
+
+def load_image(image_path, max_size=400, shape=None):
+    image = Image.open(image_path).convert("RGB")
+    if max(image.size) > max_size:
+        size = max_size
+    else:
+        size = max(image.size)
+    if shape is not None:
+        size = shape
+    in_transform = transforms.Compose([
+        transforms.Resize((size, size)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+    image = in_transform(image).unsqueeze(0)
+    return image.to(device)
+
+def im_convert(tensor):
+    image = tensor.to("cpu").clone().detach()
+    image = image.numpy().squeeze()
+    image = image.transpose(1, 2, 0)
+    image = image * (0.229, 0.224, 0.225) + (0.485, 0.456, 0.406)
+    image = image.clip(0, 1)
+    return image
+
+class ContentLoss(nn.Module):
+    def __init__(self, target):
+        super(ContentLoss, self).__init__()
+        self.target = target.detach()
+
+    def forward(self, input):
+        self.loss = nn.functional.mse_loss(input, self.target)
+        return input
+
+class StyleLoss(nn.Module):
+    def __init__(self, target_feature):
+        super(StyleLoss, self).__init__()
+        self.target = self.gram_matrix(target_feature).detach()
+
+    def gram_matrix(self, input):
+        batch, channels, height, width = input.size()
+        features = input.view(channels, height * width)
+        G = torch.mm(features, features.t())
+        return G.div(channels * height * width)
+
+    def forward(self, input):
+        G = self.gram_matrix(input)
+        self.loss = nn.functional.mse_loss(G, self.target)
+        return input
+
+device = ("cuda" if torch.cuda.is_available() else "cpu")
+
+content_image = load_image("path/to/content_image.jpg").to(device)
+style_image = load_image("path/to/style_image.jpg", shape=content_image.shape[-2:]).to(device)
+
+vgg = models.vgg19(pretrained=True).features.to(device).eval()
+
+content_layers = ["conv_4"]
+style_layers = ["conv_1", "conv_2", "conv_3", "conv_4", "conv_5"]
+
+content_losses = []
+style_losses = []
+
+model = nn.Sequential()
+i = 0
+for layer in vgg.children():
+    if isinstance(layer, nn.Conv2d):
+        i += 1
+        name = f"conv_{i}"
+    elif isinstance(layer, nn.ReLU):
+        name = f"relu_{i}"
+        layer = nn.ReLU(inplace=False)
+    elif isinstance(layer, nn.MaxPool2d):
+        name = f"pool_{i}"
+    elif isinstance(layer, nn.BatchNorm2d):
+        name = f"bn_{i}"
+    model.add_module(name, layer)
+    
+    if name in content_layers:
+        target = model(content_image).detach()
+        content_loss = ContentLoss(target)
+        model.add_module(f"content_loss_{i}", content_loss)
+        content_losses.append(content_loss)
+    
+    if name in style_layers:
+        target_feature = model(style_image).detach()
+        style_loss = StyleLoss(target_feature)
+        model.add_module(f"style_loss_{i}", style_loss)
+        style_losses.append(style_loss)
+    
+    if name == "conv_5":
+        break
+
+input_image = content_image.clone().requires_grad_(True)
+
+optimizer = optim.LBFGS([input_image])
+
+style_weight = 1e6
+content_weight = 1
+
+def closure():
+    input_image.data.clamp_(0, 1)
+    optimizer.zero_grad()
+    model(input_image)
+    style_score = 0
+    content_score = 0
+    
+    for sl in style_losses:
+        style_score += sl.loss
+    for cl in content_losses:
+        content_score += cl.loss
+    
+    style_score *= style_weight
+    content_score *= content_weight
+    
+    loss = style_score + content_score
+    loss.backward()
+    return style_score + content_score
+
+num_steps = 300
+for step in range(num_steps):
+    optimizer.step(closure)
+
+input_image.data.clamp_(0, 1)
+
+plt.figure()
+plt.imshow(im_convert(input_image))
+plt.axis("off")
+plt.show()
